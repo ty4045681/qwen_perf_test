@@ -5,6 +5,7 @@
 每个部署会自动启停 vllm serve；详情见 perf_sweep/orchestrator.py。
 """
 import argparse
+import os
 import sys
 
 from perf_sweep.deployments import (
@@ -12,8 +13,27 @@ from perf_sweep.deployments import (
     AIS_WORK_DIR,
     MAX_OUT_LEN,
     RESOURCE_SAMPLE_INTERVAL_S,
+    VLLM_HOST,
 )
 from perf_sweep.orchestrator import run
+
+
+def _ensure_no_proxy_for_localhost() -> None:
+    """把本机回环地址加进 no_proxy/NO_PROXY。
+
+    vllm 跑在 VLLM_HOST 上，就绪检测用的 urllib（vllm_server._http_ok）和
+    ais_bench 压测子进程都直连这个地址。若环境里设了 http(s)_proxy 而 no_proxy
+    未包含 127.0.0.1，请求会被丢给代理 → 卡在 waiting for ready / 压测连不上
+    （此时 curl 反而能通，因为 curl 默认绕过 localhost）。这里在进程内补齐，
+    确保 urllib 与继承本进程 env 的子进程都直连。
+    """
+    local = ["127.0.0.1", "localhost", "::1", VLLM_HOST]
+    for var in ("no_proxy", "NO_PROXY"):
+        parts = [p.strip() for p in os.environ.get(var, "").split(",") if p.strip()]
+        for h in local:
+            if h not in parts:
+                parts.append(h)
+        os.environ[var] = ",".join(parts)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,6 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    _ensure_no_proxy_for_localhost()
     return run(args)
 
 

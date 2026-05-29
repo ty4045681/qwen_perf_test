@@ -13,6 +13,11 @@ export LD_PRELOAD=/usr/lib64/libjemalloc.so.2:${LD_PRELOAD:-}
 export VLLM_ASCEND_ENABLE_FUSED_MC2=1
 export VLLM_ASCEND_ENABLE_FLASHCOMM1=0
 
+# 本机回环地址直连，禁止 /v1/* 请求走 http(s)_proxy，否则就绪检测与压测客户端
+# 会被代理拦截（curl 通但 python urllib / ais_bench 连不上）。
+export no_proxy="127.0.0.1,localhost,::1${no_proxy:+,${no_proxy}}"
+export NO_PROXY="$no_proxy"
+
 # Dump env for diff against manual launch
 env | sort > "__LOG_DIR__/vllm_env.log"
 which vllm > "__LOG_DIR__/vllm_which.log" 2>&1 || true

@@ -111,26 +111,27 @@ def _sweep_deployment(dep: Deployment, dep_dir: Path, datasets: dict[str, str],
                       rows: list[dict], summary_csv: Path) -> None:
     """跑完单个部署的全部 (batch_size × dataset) 组合，结果 append 到 rows。"""
     proc = None
-    if not args.skip_launch:
-        script = render_start_script(dep, dep_dir, TEMPLATE_PATH, MODEL_PATH, VLLM_PORT)
-        print(f"[orch] {dep.name}: start script -> {script}")
-        if args.dry_run:
-            print(f"[orch] dry-run: 不启动 vllm")
-            return
-        proc = start_vllm(script, dep_dir / "vllm.log")
-        if not wait_until_ready(VLLM_HOST, VLLM_PORT, proc,
-                                timeout=args.ready_timeout):
-            print(f"[orch] {dep.name}: 未就绪，跳过本部署")
-            stop_vllm(proc)
-            wait_port_free(VLLM_HOST, VLLM_PORT)
-            return
-    else:
-        print(f"[orch] {dep.name}: skip-launch，假定 vllm 已在 {VLLM_HOST}:{VLLM_PORT}")
-
-    res_log_dir = dep_dir / "resource_samples"
-    res_log_dir.mkdir(exist_ok=True)
-
+    # 整个生命周期（含 start_vllm / wait_until_ready）都纳入 try/finally，
+    # 这样即便卡在就绪检测时按 Ctrl-C，KeyboardInterrupt 也会触发 finally
+    # 把已启动的 vllm 杀掉，不会泄漏进程。
     try:
+        if not args.skip_launch:
+            script = render_start_script(dep, dep_dir, TEMPLATE_PATH, MODEL_PATH, VLLM_PORT)
+            print(f"[orch] {dep.name}: start script -> {script}")
+            if args.dry_run:
+                print(f"[orch] dry-run: 不启动 vllm")
+                return
+            proc = start_vllm(script, dep_dir / "vllm.log")
+            if not wait_until_ready(VLLM_HOST, VLLM_PORT, proc,
+                                    timeout=args.ready_timeout):
+                print(f"[orch] {dep.name}: 未就绪，跳过本部署")
+                return  # finally 负责 stop_vllm + wait_port_free
+        else:
+            print(f"[orch] {dep.name}: skip-launch，假定 vllm 已在 {VLLM_HOST}:{VLLM_PORT}")
+
+        res_log_dir = dep_dir / "resource_samples"
+        res_log_dir.mkdir(exist_ok=True)
+
         for bs in batch_sizes:
             patch_config(bs, args.max_out_len, args.config)
             num_prompt = bs * 2
