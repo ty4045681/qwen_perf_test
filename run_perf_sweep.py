@@ -7,7 +7,12 @@
 import argparse
 import sys
 
-from perf_sweep.deployments import AIS_CONFIG_PATH, AIS_WORK_DIR, MAX_OUT_LEN
+from perf_sweep.deployments import (
+    AIS_CONFIG_PATH,
+    AIS_WORK_DIR,
+    MAX_OUT_LEN,
+    RESOURCE_SAMPLE_INTERVAL_S,
+)
 from perf_sweep.orchestrator import run
 
 
@@ -34,6 +39,15 @@ def build_parser() -> argparse.ArgumentParser:
                     help="只渲染 start_vllm.sh，不真启动 vllm 也不跑 ais_bench")
     ap.add_argument("--skip-launch", action="store_true",
                     help="不启动 vllm（假定已手动启动好），仅跑 sweep")
+
+    ap.add_argument("--no-monitor", action="store_true",
+                    help="关闭资源监控（CPU/NPU AI core/显存）")
+    ap.add_argument("--monitor-interval", type=float,
+                    default=RESOURCE_SAMPLE_INTERVAL_S,
+                    help="资源采样间隔秒数（默认 2.0s）")
+    ap.add_argument("--monitor-raw", action="store_true",
+                    help="每次 run_one 把每次采样的原始值落到 "
+                         "<dep>/resource_samples/bs{N}_{lang}.tsv，便于事后画时序图")
     return ap
 
 

@@ -54,7 +54,13 @@ DATASETS: dict[str, str] = {
 
 # ---------------------- 评测参数 ----------------------
 MAX_OUT_LEN = 200
-E2EL_BUDGET_S = 60.0
+
+# E2E 延迟门槛（秒），从严到宽。画图时按列表顺序叠加视觉标记：
+#   E2EL_BUDGETS[0]  = 警告  (橙)
+#   E2EL_BUDGETS[1]  = 严重  (红)
+E2EL_BUDGETS: list[float] = [60.0, 120.0]
+# 资源监控采样间隔（秒）。非 Ascend 机器仍会采 CPU/内存。
+RESOURCE_SAMPLE_INTERVAL_S = 2.0
 
 # ---------------------- 项目内相对路径 ----------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent

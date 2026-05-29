@@ -16,11 +16,13 @@ from .deployments import (
     Deployment,
     MAX_OUT_LEN,
     MODEL_PATH,
+    RESOURCE_SAMPLE_INTERVAL_S,
     TEMPLATE_PATH,
     VLLM_HOST,
     VLLM_PORT,
 )
-from .plotter import plot_aggregated, plot_per_deployment
+from .plotter import plot_aggregated, plot_per_card, plot_per_deployment
+from .resource_monitor import EMPTY_RESULT as EMPTY_RES_FIELDS, ResourceMonitor
 from .result_parser import collect_results
 from .vllm_server import (
     render_start_script,
@@ -31,31 +33,42 @@ from .vllm_server import (
 )
 
 
-CSV_FIELDS = [
+PERF_FIELDS = [
     "deployment", "tp", "dp",
     "batch_size", "dataset", "num_prompt",
     "E2EL(ms)", "TTFT(ms)", "TPOT(ms)", "ITL(ms)", "OTT(token/s)",
-    "source_file",
+]
+# resource_monitor.EMPTY_RESULT 的 key 顺序就是我们想要的列顺序
+RES_FIELDS = list(EMPTY_RES_FIELDS.keys())
+CSV_FIELDS = PERF_FIELDS + RES_FIELDS + ["source_file"]
+
+PER_CARD_FIELDS = [
+    "deployment", "tp", "dp", "n_cards",
+    "batch_size", "n_datasets",
+    "OTT_mean(token/s)", "OTT_per_card_mean(token/s)",
+    "E2EL_mean(ms)", "E2EL_max(ms)", "worst_E2EL_tier",
 ]
 
 
 # ---------------------- CSV ----------------------
-def _write_csv(rows: list[dict], path: Path) -> None:
+def _write_csv(rows: list[dict], path: Path, fieldnames: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for r in rows:
-            w.writerow({k: r.get(k, "") for k in CSV_FIELDS})
+            w.writerow({k: r.get(k, "") for k in fieldnames})
 
 
 def _empty_row(dep: Deployment, bs: int, lang: str, num_prompt: int) -> dict:
-    return {
+    row = {
         "deployment": dep.name, "tp": dep.tp, "dp": dep.dp,
         "batch_size": bs, "dataset": lang, "num_prompt": num_prompt,
         "E2EL(ms)": "", "TTFT(ms)": "", "TPOT(ms)": "",
         "ITL(ms)": "", "OTT(token/s)": "", "source_file": "",
     }
+    row.update(EMPTY_RES_FIELDS)
+    return row
 
 
 # ---------------------- 选择/过滤 ----------------------
@@ -110,29 +123,96 @@ def _sweep_deployment(dep: Deployment, dep_dir: Path, datasets: dict[str, str],
     else:
         print(f"[orch] {dep.name}: skip-launch，假定 vllm 已在 {VLLM_HOST}:{VLLM_PORT}")
 
+    res_log_dir = dep_dir / "resource_samples"
+    res_log_dir.mkdir(exist_ok=True)
+
     try:
         for bs in batch_sizes:
             patch_config(bs, args.max_out_len, args.config)
             num_prompt = bs * 2
             for lang, path in datasets.items():
+                row = _empty_row(dep, bs, lang, num_prompt)
+
+                # 起监控
+                mon = None
+                if not args.no_monitor:
+                    raw_log = res_log_dir / f"bs{bs}_{lang}.tsv" if args.monitor_raw else None
+                    mon = ResourceMonitor(
+                        interval_s=args.monitor_interval,
+                        raw_log=raw_log,
+                    )
+                    mon.start()
+
                 since = time.time()
-                run_one(bs, path, args.work_dir)
+                try:
+                    run_one(bs, path, args.work_dir)
+                finally:
+                    if mon is not None:
+                        row.update(mon.stop())
+
                 parsed = collect_results(args.work_dir, lang, since)
                 if parsed is None:
                     print(f"       [warn] 未找到 {dep.name} bs={bs} {lang} 的 perf 结果")
-                    rows.append(_empty_row(dep, bs, lang, num_prompt))
                 else:
                     metrics, src = parsed
-                    row = _empty_row(dep, bs, lang, num_prompt)
                     row.update({k: ("" if v is None else v) for k, v in metrics.items()})
                     row["source_file"] = str(src)
-                    rows.append(row)
                     print(f"       got: {metrics} <- {src}")
-                _write_csv(rows, summary_csv)  # 增量落盘
+                if mon is not None and row.get("resource_samples"):
+                    print(f"       res: cpu_avg={row['cpu_util_avg(%)']}% "
+                          f"npu_aicore_avg={row['npu_aicore_avg(%)']}% "
+                          f"npu_mem_max={row['npu_mem_used_max(MB)']}MB "
+                          f"(samples={row['resource_samples']})")
+                rows.append(row)
+                _write_csv(rows, summary_csv, CSV_FIELDS)  # 增量落盘
     finally:
         if proc is not None:
             stop_vllm(proc)
             wait_port_free(VLLM_HOST, VLLM_PORT)
+
+
+# ---------------------- 单卡吞吐汇总 ----------------------
+def _build_per_card_rows(rows: list[dict], deployments: list[Deployment]) -> list[dict]:
+    """跨数据集求 OTT 均值，再除以 tp*dp。每个 (dep, bs) 一行。"""
+    dep_of = {d.name: d for d in deployments}
+    bucket: dict[tuple[str, int], dict] = {}
+    for r in rows:
+        if r.get("OTT(token/s)") in ("", None):
+            continue
+        if r["deployment"] not in dep_of:
+            continue
+        key = (r["deployment"], r["batch_size"])
+        slot = bucket.setdefault(key, {"otts": [], "e2els": []})
+        slot["otts"].append(float(r["OTT(token/s)"]))
+        try:
+            slot["e2els"].append(float(r["E2EL(ms)"]))
+        except (TypeError, ValueError, KeyError):
+            pass
+
+    # 用 plotter 的 _worst_tier 保持视觉编码一致
+    from .plotter import _worst_tier  # 局部 import 避免循环
+
+    out: list[dict] = []
+    for (dep_name, bs), slot in sorted(bucket.items()):
+        dep = dep_of[dep_name]
+        n_cards = dep.tp * dep.dp
+        mean_ott = sum(slot["otts"]) / len(slot["otts"])
+        e2el_mean = (sum(slot["e2els"]) / len(slot["e2els"])) if slot["e2els"] else ""
+        e2el_max = max(slot["e2els"]) if slot["e2els"] else ""
+        worst_tier = -1
+        for e in slot["e2els"]:
+            worst_tier = max(worst_tier, _worst_tier(e / 1000.0))
+        out.append({
+            "deployment": dep_name, "tp": dep.tp, "dp": dep.dp,
+            "n_cards": n_cards,
+            "batch_size": bs, "n_datasets": len(slot["otts"]),
+            "OTT_mean(token/s)": round(mean_ott, 2),
+            "OTT_per_card_mean(token/s)": round(mean_ott / n_cards, 2),
+            "E2EL_mean(ms)": round(e2el_mean, 1) if isinstance(e2el_mean, float) else "",
+            "E2EL_max(ms)": round(e2el_max, 1) if isinstance(e2el_max, float) else "",
+            "worst_E2EL_tier": worst_tier,
+        })
+    return out
 
 
 # ---------------------- 入口 ----------------------
@@ -149,6 +229,7 @@ def run(args: Namespace) -> int:
     print(f"[orch] run_root = {run_root}")
     print(f"[orch] deployments = {[d.name for d in deployments]}")
     print(f"[orch] datasets    = {list(datasets)}")
+    print(f"[orch] resource monitor = {'OFF' if args.no_monitor else f'ON (every {args.monitor_interval:.1f}s)'}")
 
     summary_csv = run_root / "perf_summary.csv"
     rows: list[dict] = []
@@ -169,7 +250,12 @@ def run(args: Namespace) -> int:
     for dep in deployments:
         dep_rows = [r for r in rows if r["deployment"] == dep.name]
         if dep_rows:
-            _write_csv(dep_rows, run_root / f"perf_summary_{dep.name}.csv")
+            _write_csv(dep_rows, run_root / f"perf_summary_{dep.name}.csv", CSV_FIELDS)
+
+    # 单卡平均吞吐 CSV
+    per_card_rows = _build_per_card_rows(rows, deployments)
+    if per_card_rows:
+        _write_csv(per_card_rows, run_root / "per_card_summary.csv", PER_CARD_FIELDS)
 
     # 画图
     for dep in deployments:
@@ -179,6 +265,7 @@ def run(args: Namespace) -> int:
                                 run_root / f"perf_throughput_{dep.name}.png")
     if len(deployments) > 1:
         plot_aggregated(rows, deployments, run_root / "perf_throughput.png")
+        plot_per_card(rows, deployments, run_root / "per_card_throughput.png")
 
     print(f"\n[orch] done. {len(rows)} rows -> {summary_csv}")
     return 0

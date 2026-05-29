@@ -5,7 +5,9 @@
 - **6 套部署**（tp/dp 组合）的自动启停
 - 每套部署内遍历各自的 batch_size 序列
 - 每个 batch_size 跑 ar/en/es/pt/zh **5 个语言数据集**
-- 汇总 CSV + 单部署双面板图 + 6 部署聚合图
+- 每次测试**后台采样** CPU% / NPU AI core% / NPU 显存（`npu-smi info`）
+- 输出：汇总 CSV、单卡平均吞吐 CSV、单部署双面板图、6 部署聚合图、**单卡吞吐对比图**
+- E2EL **两档门槛**：60s（橙）/ 120s（红），分别在图上以不同样式标记
 
 部署/参数矩阵：
 
@@ -32,8 +34,9 @@ qwen_perf_test/
 │   ├── vllm_server.py           # 渲染脚本 / 启停 vllm / ready check
 │   ├── ais_bench_runner.py      # patch_config + run_one（调用 ais_bench）
 │   ├── result_parser.py         # 解析 ais_bench 的 CSV/JSON
-│   ├── plotter.py               # 单部署双面板图 + 6 聚合子图
-│   └── orchestrator.py          # 主循环 + 增量 CSV
+│   ├── resource_monitor.py      # CPU/内存/NPU AI core+显存 后台采样
+│   ├── plotter.py               # 单部署双面板图 + 聚合图 + 单卡吞吐对比图
+│   └── orchestrator.py          # 主循环 + 增量 CSV + 单卡汇总
 └── templates/
     └── start_vllm.sh.tpl        # vllm 启动 bash 模板（env 全在 bash 里 export）
 ```
@@ -47,11 +50,14 @@ runs/20260528_153000/
 │   ├── vllm.log                 # vllm serve 的 stdout+stderr
 │   ├── vllm_env.log             # 启动瞬间 env|sort 的快照（用于对比手动启动）
 │   ├── vllm_which.log           # which vllm + vllm --version
-│   └── vllm.pid
+│   ├── vllm.pid
+│   └── resource_samples/        # 仅 --monitor-raw 时；按 bs/lang 一份原始时序 TSV
 ├── tp2_dp2/  ...                # 其余 5 个部署同结构
-├── perf_summary.csv             # 全部 6 部署聚合，有 deployment/tp/dp 列
+├── perf_summary.csv             # 全部 6 部署聚合，含 CPU/NPU 资源列
 ├── perf_summary_tp2_dp1.csv     # 6 个分部署 CSV
-├── perf_throughput.png          # 2×3 聚合图（throughput 面板，红圈=E2EL>60s）
+├── per_card_summary.csv         # (deployment, batch_size) 跨数据集均值 / 单卡吞吐
+├── perf_throughput.png          # 2×3 聚合图（throughput 面板，橙环=E2EL>60s, 红实心=>120s）
+├── per_card_throughput.png      # 单卡吞吐对比图（每部署一条曲线）
 └── perf_throughput_tp2_dp1.png  # 6 个单部署双面板图
 ```
 
@@ -65,6 +71,7 @@ runs/20260528_153000/
 - 模型权重位于 `/data/q00931063/Qwen3.6-35B-A3B-w8a8/`（在 `perf_sweep/deployments.py` 改 `MODEL_PATH`）
 - 数据集 5 个 jsonl 位于 `/data/q00931063/test/{ar,en,es,pt,zh}.jsonl`（同上文件改 `DATASETS`）
 - `/workspace/benchmark/ais_bench/benchmark/configs/models/vllm_api/vllm_api_stream_chat.py` 存在（脚本会原地改 `batch_size`/`max_out_len` 两个字段）
+- `npu-smi` 在 PATH 里（资源监控的 NPU 数据来源；缺失时仅 NPU 字段留空，CPU/内存仍能采）
 - `matplotlib`（可选 —— 没装会跳过画图，CSV 仍正常生成）
 
 NPU/CANN 相关 env 不需要在 Python 里管理，由 `templates/start_vllm.sh.tpl` 里的 `export` 和 `bash -lc` 加载用户 profile 共同负责。
@@ -83,7 +90,8 @@ AIS_CONFIG_PATH  = "/workspace/benchmark/ais_bench/benchmark/configs/models/vllm
 AIS_WORK_DIR     = "/data/q00931063/910B3_result"
 DATASETS         = {...}
 MAX_OUT_LEN      = 200
-E2EL_BUDGET_S    = 60.0
+E2EL_BUDGETS     = [60.0, 120.0]   # 警告 / 严重 两档；越严重越靠后
+RESOURCE_SAMPLE_INTERVAL_S = 2.0
 DEPLOYMENTS      = [Deployment(tp=2, dp=1, batch_sizes=[...], cudagraph_capture_sizes=[...]), ...]
 ```
 
@@ -115,6 +123,9 @@ python3 run_perf_sweep.py
 | `--work-dir <path>`      | 覆盖 ais_bench `--work-dir` |
 | `--dry-run`              | 只渲染 6 份 `start_vllm.sh`，不真启 vllm，也不跑 ais_bench |
 | `--skip-launch`          | 不启动 vllm（你已手动起好），仅跑 sweep |
+| `--no-monitor`           | 关闭资源监控（CPU/NPU/显存采样） |
+| `--monitor-interval 2.0` | 资源采样间隔秒数（默认 2.0s） |
+| `--monitor-raw`          | 额外把每次采样原始值落到 `<dep>/resource_samples/bs{N}_{lang}.tsv` 便于事后画时序图 |
 
 ### 上线前推荐验证顺序
 
@@ -162,9 +173,11 @@ tail -f sweep.out
 
 中途允许 Ctrl-C —— 由于增量写 CSV，已完成的行不会丢；`vllm` 子进程组会被 `SIGTERM` 干净杀掉，验证：`ps -ef | grep vllm` 应为空。
 
-**5. 检查聚合图**
+**5. 检查聚合图与单卡吞吐**
 
-`runs/<时间戳>/perf_throughput.png` —— 2×3 子图，每格一个部署，红圈标 E2EL>60s。
+- `runs/<时间戳>/perf_throughput.png` —— 2×3 子图，每格一个部署，橙环=E2EL>60s，红实心=E2EL>120s
+- `runs/<时间戳>/per_card_throughput.png` —— 6 条曲线一张图，**横向对比哪种部署单卡最划算**
+- `runs/<时间戳>/per_card_summary.csv` —— 每行 = 一个 (deployment, batch_size) 的均值 + 单卡均吞吐
 
 ---
 
@@ -172,7 +185,7 @@ tail -f sweep.out
 
 ### `perf_summary.csv` / `perf_summary_<dep>.csv`
 
-字段：
+每行 = 一次 `(deployment, batch_size, dataset)` 的测试。字段：
 
 | 列 | 说明 |
 |---|---|
@@ -183,12 +196,36 @@ tail -f sweep.out
 | `num_prompt` | = batch_size × 2 |
 | `E2EL(ms)` / `TTFT(ms)` / `TPOT(ms)` / `ITL(ms)` | ais_bench CSV 的 Average 列 |
 | `OTT(token/s)` | Output Token Throughput（ais_bench JSON） |
+| `cpu_util_avg(%)` / `cpu_util_max(%)` | 测试期间 CPU 利用率（/proc/stat 差分） |
+| `mem_util_avg(%)` / `mem_util_max(%)` | 系统内存使用率（/proc/meminfo） |
+| `npu_aicore_avg(%)` / `npu_aicore_max(%)` | "在用"卡（任一快照显存 ≥ 1GB）的 AI core 利用率 |
+| `npu_mem_used_max(MB)` | 单卡显存峰值（MB） |
+| `npu_mem_used_max_chip` | 峰值发生在哪张卡（chip id） |
+| `npu_loaded_chips` | 该次测试期间被认定"在用"的 chip 列表（逗号分隔） |
+| `resource_samples` | 实际采到的样本数（间隔 2s × run 时长） |
 | `source_file` | 解析时取到的 ais_bench csv 路径，便于回溯 |
+
+非 Ascend 机器或 `npu-smi` 不可用时，`npu_*` 列留空；`--no-monitor` 时所有资源列留空。
+
+### `per_card_summary.csv`
+
+每行 = 一个 `(deployment, batch_size)` 跨 5 个数据集的均值。**这是横向对比哪种部署单卡最划算的核心表**。
+
+| 列 | 说明 |
+|---|---|
+| `deployment` / `tp` / `dp` / `n_cards` | `n_cards = tp × dp` |
+| `batch_size` |  |
+| `n_datasets` | 实际参与均值的数据集数（默认 5） |
+| `OTT_mean(token/s)` | 跨数据集 OTT 均值（整机吞吐） |
+| `OTT_per_card_mean(token/s)` | = `OTT_mean / n_cards` |
+| `E2EL_mean(ms)` / `E2EL_max(ms)` | 跨数据集 E2EL 均值/最大值 |
+| `worst_E2EL_tier` | 该组合跨数据集见过的最高门槛档（-1 = 都没超过, 0 = >60s, 1 = >120s） |
 
 ### 图
 
-- **单部署图** `perf_throughput_<dep>.png`：双面板 —— 上 throughput vs concurrency（红圈=E2EL>60s）；下 E2EL vs concurrency（红虚线=60s 预算）
+- **单部署图** `perf_throughput_<dep>.png`：双面板 —— 上 throughput vs concurrency（橙环=E2EL>60s, 红实心=>120s）；下 E2EL vs concurrency（两条虚线分别是 60s/120s 门槛）
 - **聚合图** `perf_throughput.png`：2×3 子图，每格一个部署的 throughput 面板，shared y 轴便于横向对比
+- **单卡吞吐对比图** `per_card_throughput.png`：6 条曲线一张图，横轴 batch_size，纵轴单卡吞吐（跨 5 数据集均值），同样的 E2EL 视觉编码
 
 ---
 
@@ -213,3 +250,11 @@ A: 脚本捕获 stderr 末尾 2000 字符打到 stdout。也可以去 ais_bench 
 **Q: 想跳过 vllm 启停，自己手动起服务调试 sweep 链路？**
 
 A: 手动启动 vllm 后：`python3 run_perf_sweep.py --skip-launch --only tp4_dp2 --batch-sizes 100 --datasets en`。
+
+**Q: 资源监控开销大吗？怎么看到原始时序？**
+
+A: 默认 2s 采一次，调一次 `npu-smi info` 大约几十 ms；对 ais_bench perf 测试的影响可以忽略。要看原始时序加 `--monitor-raw`，每次 run 会写一个 `<dep>/resource_samples/bs{N}_{lang}.tsv`，每行 `t_relative cpu mem npu_chips_list`，可以直接 `awk` / `gnuplot` 画时序图。
+
+**Q: 怎么改 E2EL 门槛？比如想加一档 30s？**
+
+A: 改 `perf_sweep/deployments.py` 的 `E2EL_BUDGETS`，从严到宽顺序排即可（如 `[30.0, 60.0, 120.0]`）。`plotter.py` 的 `_TIER_STYLES` 也要补一档样式（再加一个 dict），否则会复用最后一档样式。

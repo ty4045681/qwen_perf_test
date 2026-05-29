@@ -1,9 +1,22 @@
-"""画图：单部署双面板 + 6 部署聚合。"""
+"""画图：单部署双面板 + 6 部署聚合 + 单卡吞吐对比。"""
 from __future__ import annotations
 
 from pathlib import Path
 
-from .deployments import Deployment, E2EL_BUDGET_S
+from .deployments import Deployment, E2EL_BUDGETS
+
+
+# E2EL 门槛的视觉编码：从严到宽叠加，越严重越靠后绘制以覆盖在上层。
+# 与 deployments.E2EL_BUDGETS 一一对应（位置 0=警告，位置 1=严重）。
+_TIER_STYLES = [
+    # (overlay color, line color, line style, label suffix)
+    {"overlay_face": "none",   "overlay_edge": "darkorange", "line_color": "darkorange", "line_style": "--", "z": 4},
+    {"overlay_face": "red",    "overlay_edge": "red",        "line_color": "red",        "line_style": "--", "z": 6},
+]
+
+
+def _budget_style(idx: int) -> dict:
+    return _TIER_STYLES[idx] if idx < len(_TIER_STYLES) else _TIER_STYLES[-1]
 
 
 def _try_import_matplotlib():
@@ -28,23 +41,40 @@ def _group_by_lang(rows: list[dict]) -> dict:
     return by_lang
 
 
+def _e2el_seconds(r: dict) -> float | None:
+    try:
+        return float(r["E2EL(ms)"]) / 1000.0
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def _worst_tier(e2el_s: float | None) -> int:
+    """返回 e2el 跨过的最高门槛位置；都没跨返回 -1。"""
+    if e2el_s is None:
+        return -1
+    worst = -1
+    for i, b in enumerate(E2EL_BUDGETS):
+        if e2el_s > b:
+            worst = i
+    return worst
+
+
 def _draw_throughput(ax, by_lang: dict, lang_color: dict,
                      *, with_legend: bool, title: str | None) -> None:
-    """画 Throughput vs Concurrency 曲线 + E2EL 超预算红圈。"""
+    """画 Throughput vs Concurrency 曲线 + 多档 E2EL 超预算标记。"""
     for lang, lst in sorted(by_lang.items()):
         xs = [r["batch_size"] for r in lst]
         ys = [float(r["OTT(token/s)"]) for r in lst]
         ax.plot(xs, ys, marker="o", color=lang_color[lang],
                 label=lang, linewidth=1.8)
         for r in lst:
-            try:
-                e2el_s = float(r["E2EL(ms)"]) / 1000.0
-            except (TypeError, ValueError):
+            tier = _worst_tier(_e2el_seconds(r))
+            if tier < 0:
                 continue
-            if e2el_s > E2EL_BUDGET_S:
-                ax.scatter([r["batch_size"]], [float(r["OTT(token/s)"])],
-                           s=140, facecolors="none", edgecolors="red",
-                           linewidths=1.8, zorder=5)
+            s = _budget_style(tier)
+            ax.scatter([r["batch_size"]], [float(r["OTT(token/s)"])],
+                       s=140, facecolors=s["overlay_face"], edgecolors=s["overlay_edge"],
+                       linewidths=1.8, zorder=s["z"])
     ax.set_ylabel("Output Throughput (token/s)")
     ax.grid(True, alpha=0.3)
     if title:
@@ -54,27 +84,42 @@ def _draw_throughput(ax, by_lang: dict, lang_color: dict,
 
 
 def _draw_e2el(ax, by_lang: dict, lang_color: dict, all_bs: list[int]) -> None:
-    """下面板：E2EL vs Concurrency + 预算虚线。"""
+    """下面板：E2EL vs Concurrency + 各档预算虚线。"""
     for lang, lst in sorted(by_lang.items()):
         xs, ys = [], []
         for r in lst:
-            try:
-                e2el_s = float(r["E2EL(ms)"]) / 1000.0
-            except (TypeError, ValueError):
+            e2el_s = _e2el_seconds(r)
+            if e2el_s is None:
                 continue
             xs.append(r["batch_size"])
             ys.append(e2el_s)
         if xs:
             ax.plot(xs, ys, marker="o", color=lang_color[lang],
                     linewidth=1.8, label=lang)
-    ax.axhline(E2EL_BUDGET_S, color="red", linestyle="--", linewidth=1.2,
-               label=f"E2EL budget = {E2EL_BUDGET_S:.0f}s")
+    for i, b in enumerate(E2EL_BUDGETS):
+        s = _budget_style(i)
+        ax.axhline(b, color=s["line_color"], linestyle=s["line_style"],
+                   linewidth=1.2, label=f"E2EL budget = {b:.0f}s")
     ax.set_xlabel("Concurrency (batch_size)")
     ax.set_ylabel("E2E Latency (s)")
     if all_bs:
         ax.set_xticks(all_bs)
     ax.grid(True, alpha=0.3)
-    ax.legend(loc="upper left", ncol=max(1, len(by_lang) + 1), fontsize=8)
+    ax.legend(loc="upper left", ncol=max(1, len(by_lang) + len(E2EL_BUDGETS)), fontsize=8)
+
+
+def _budget_legend_handles(plt):
+    handles = []
+    for i, b in enumerate(E2EL_BUDGETS):
+        s = _budget_style(i)
+        handles.append(plt.Line2D(
+            [0], [0], marker="o", linestyle="",
+            markerfacecolor=(s["overlay_face"] if s["overlay_face"] != "none" else "white"),
+            markeredgecolor=s["overlay_edge"],
+            markersize=10, markeredgewidth=1.8,
+            label=f"E2EL > {b:.0f}s",
+        ))
+    return handles
 
 
 def plot_per_deployment(rows: list[dict], dep: Deployment, out_path: Path) -> None:
@@ -94,12 +139,16 @@ def plot_per_deployment(rows: list[dict], dep: Deployment, out_path: Path) -> No
     cmap = plt.get_cmap("tab10")
     lang_color = {lang: cmap(i) for i, lang in enumerate(sorted(by_lang.keys()))}
 
+    budget_desc = ", ".join(
+        f"{_budget_style(i)['overlay_edge']} = E2EL>{b:.0f}s"
+        for i, b in enumerate(E2EL_BUDGETS)
+    )
     _draw_throughput(
         ax_top, by_lang, lang_color,
         with_legend=True,
         title=(f"910B3 Qwen3.6-35B-A3B-w8a8 [{dep.name}]: "
                f"Throughput & E2E Latency vs Concurrency\n"
-               f"(red open circle = E2EL > {E2EL_BUDGET_S:.0f}s)"),
+               f"({budget_desc})"),
     )
     all_bs = sorted({r["batch_size"] for lst in by_lang.values() for r in lst})
     _draw_e2el(ax_bot, by_lang, lang_color, all_bs)
@@ -122,7 +171,6 @@ def plot_aggregated(rows: list[dict], deployments: list[Deployment],
         if r.get("deployment") in by_dep:
             by_dep[r["deployment"]].append(r)
 
-    # 收集全局 lang 集合，保证子图颜色一致
     all_langs = sorted({r["dataset"] for r in rows
                         if r.get("OTT(token/s)") not in ("", None)})
     cmap = plt.get_cmap("tab10")
@@ -141,31 +189,103 @@ def plot_aggregated(rows: list[dict], deployments: list[Deployment],
             ax.set_title(f"{dep.name}  (no data)")
             ax.grid(True, alpha=0.3)
             continue
-        _draw_throughput(
-            ax, by_lang, lang_color,
-            with_legend=False,
-            title=dep.name,
-        )
+        _draw_throughput(ax, by_lang, lang_color, with_legend=False, title=dep.name)
         ax.set_xlabel("Concurrency (batch_size)")
 
-    # 多出来的格子隐藏
     for ax in axes[len(deployments):]:
         ax.set_visible(False)
 
-    # 统一 legend 放在 figure 顶部
     handles = [plt.Line2D([0], [0], marker="o", color=lang_color[lang],
                           label=lang, linewidth=1.8)
                for lang in all_langs]
-    handles.append(plt.Line2D([0], [0], marker="o", linestyle="",
-                              markerfacecolor="none", markeredgecolor="red",
-                              markersize=10, markeredgewidth=1.8,
-                              label=f"E2EL > {E2EL_BUDGET_S:.0f}s"))
+    handles.extend(_budget_legend_handles(plt))
     fig.legend(handles=handles, loc="upper center",
-               ncol=len(all_langs) + 1, bbox_to_anchor=(0.5, 1.02))
+               ncol=len(all_langs) + len(E2EL_BUDGETS),
+               bbox_to_anchor=(0.5, 1.02))
     fig.suptitle("910B3 Qwen3.6-35B-A3B-w8a8: Throughput vs Concurrency across deployments",
                  y=1.06, fontsize=13)
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] saved -> {out_path}")
+
+
+# ---------------------- 单卡吞吐对比 ----------------------
+def _per_card_aggregate(rows: list[dict], deployments: list[Deployment]) -> dict:
+    """返回 {dep_name: [(batch_size, per_card_ott, worst_tier_across_langs), ...]}。
+
+    per_card_ott = mean(OTT across langs) / (tp*dp)
+    worst_tier = 该 (dep, bs) 跨数据集里出现过的最高 E2EL 门槛档位。
+    """
+    bucket: dict[tuple[str, int], dict] = {}
+    dep_of = {d.name: d for d in deployments}
+    for r in rows:
+        if r.get("OTT(token/s)") in ("", None):
+            continue
+        dep_name = r["deployment"]
+        if dep_name not in dep_of:
+            continue
+        key = (dep_name, r["batch_size"])
+        slot = bucket.setdefault(key, {"otts": [], "worst_tier": -1})
+        slot["otts"].append(float(r["OTT(token/s)"]))
+        slot["worst_tier"] = max(slot["worst_tier"], _worst_tier(_e2el_seconds(r)))
+
+    out: dict[str, list[tuple[int, float, int]]] = {d.name: [] for d in deployments}
+    for (dep_name, bs), slot in bucket.items():
+        dep = dep_of[dep_name]
+        mean_ott = sum(slot["otts"]) / len(slot["otts"])
+        per_card = mean_ott / (dep.tp * dep.dp)
+        out[dep_name].append((bs, per_card, slot["worst_tier"]))
+    for v in out.values():
+        v.sort()
+    return out
+
+
+def plot_per_card(rows: list[dict], deployments: list[Deployment], out_path: Path) -> None:
+    """每个部署一条曲线：横轴 batch_size，纵轴跨数据集平均后的单卡吞吐。"""
+    plt = _try_import_matplotlib()
+    if plt is None:
+        return
+
+    series = _per_card_aggregate(rows, deployments)
+    if not any(series.values()):
+        print("[plot] per-card: 无数据")
+        return
+
+    fig, ax = plt.subplots(figsize=(11, 6))
+    cmap = plt.get_cmap("tab10")
+    dep_color = {d.name: cmap(i) for i, d in enumerate(deployments)}
+
+    for dep in deployments:
+        pts = series.get(dep.name, [])
+        if not pts:
+            continue
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        ax.plot(xs, ys, marker="o", linewidth=1.8,
+                color=dep_color[dep.name],
+                label=f"{dep.name} ({dep.tp * dep.dp} cards)")
+        for bs, per_card, tier in pts:
+            if tier < 0:
+                continue
+            s = _budget_style(tier)
+            ax.scatter([bs], [per_card], s=140,
+                       facecolors=s["overlay_face"], edgecolors=s["overlay_edge"],
+                       linewidths=1.8, zorder=s["z"])
+
+    ax.set_xlabel("Concurrency (batch_size)")
+    ax.set_ylabel("Per-card Output Throughput (token/s)")
+    ax.set_title(
+        "910B3 Qwen3.6-35B-A3B-w8a8: Per-card throughput vs concurrency\n"
+        "(mean across 5 datasets; overlay = worst E2EL tier seen in those datasets)"
+    )
+    ax.grid(True, alpha=0.3)
+    handles, labels = ax.get_legend_handles_labels()
+    handles = list(handles) + _budget_legend_handles(plt)
+    ax.legend(handles=handles, loc="best", fontsize=9)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=130)
     plt.close(fig)
     print(f"[plot] saved -> {out_path}")
