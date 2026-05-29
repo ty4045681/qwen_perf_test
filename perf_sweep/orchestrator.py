@@ -22,7 +22,11 @@ from .deployments import (
     VLLM_PORT,
 )
 from .plotter import plot_aggregated, plot_per_card, plot_per_deployment
-from .resource_monitor import EMPTY_RESULT as EMPTY_RES_FIELDS, ResourceMonitor
+from .resource_monitor import (
+    EMPTY_RESULT as EMPTY_RES_FIELDS,
+    ResourceMonitor,
+    effective_interval,
+)
 from .result_parser import collect_results
 from .vllm_server import (
     render_start_script,
@@ -44,7 +48,7 @@ CSV_FIELDS = PERF_FIELDS + RES_FIELDS + ["source_file"]
 
 PER_CARD_FIELDS = [
     "deployment", "tp", "dp", "n_cards",
-    "batch_size", "n_datasets",
+    "batch_size", "n_ott", "n_e2el",
     "OTT_mean(token/s)", "OTT_per_card_mean(token/s)",
     "E2EL_mean(ms)", "E2EL_max(ms)", "worst_E2EL_tier",
 ]
@@ -158,11 +162,18 @@ def _sweep_deployment(dep: Deployment, dep_dir: Path, datasets: dict[str, str],
                     row.update({k: ("" if v is None else v) for k, v in metrics.items()})
                     row["source_file"] = str(src)
                     print(f"       got: {metrics} <- {src}")
-                if mon is not None and row.get("resource_samples"):
-                    print(f"       res: cpu_avg={row['cpu_util_avg(%)']}% "
-                          f"npu_aicore_avg={row['npu_aicore_avg(%)']}% "
-                          f"npu_mem_max={row['npu_mem_used_max(MB)']}MB "
-                          f"(samples={row['resource_samples']})")
+                # 总是打印监控行（即使 resource_samples=0），便于发现监控起
+                # 起来但实际没采到数据的失败模式。
+                if mon is not None:
+                    n_samp = row.get("resource_samples", 0) or 0
+                    if n_samp:
+                        print(f"       res: cpu_avg={row['cpu_util_avg(%)']}% "
+                              f"npu_aicore_avg={row['npu_aicore_avg(%)']}% "
+                              f"npu_mem_max={row['npu_mem_used_max(MB)']}MB "
+                              f"(samples={n_samp})")
+                    else:
+                        print(f"       res: [warn] 监控已启用但未采到样本 "
+                              f"(samples=0)，可能 run_one 太短或线程异常退出")
                 rows.append(row)
                 _write_csv(rows, summary_csv, CSV_FIELDS)  # 增量落盘
     finally:
@@ -197,15 +208,24 @@ def _build_per_card_rows(rows: list[dict], deployments: list[Deployment]) -> lis
         dep = dep_of[dep_name]
         n_cards = dep.tp * dep.dp
         mean_ott = sum(slot["otts"]) / len(slot["otts"])
-        e2el_mean = (sum(slot["e2els"]) / len(slot["e2els"])) if slot["e2els"] else ""
-        e2el_max = max(slot["e2els"]) if slot["e2els"] else ""
-        worst_tier = -1
-        for e in slot["e2els"]:
-            worst_tier = max(worst_tier, _worst_tier(e / 1000.0))
+        n_e2el = len(slot["e2els"])
+        if n_e2el:
+            e2el_mean = sum(slot["e2els"]) / n_e2el
+            e2el_max = max(slot["e2els"])
+            worst_tier: int | str = -1
+            for e in slot["e2els"]:
+                worst_tier = max(int(worst_tier), _worst_tier(e / 1000.0))
+        else:
+            # 用 "" 把 "完全没有 E2EL 数据" 与 "都在最严门槛之内 (tier=-1)" 区分
+            e2el_mean = ""
+            e2el_max = ""
+            worst_tier = ""
         out.append({
             "deployment": dep_name, "tp": dep.tp, "dp": dep.dp,
             "n_cards": n_cards,
-            "batch_size": bs, "n_datasets": len(slot["otts"]),
+            "batch_size": bs,
+            "n_ott": len(slot["otts"]),
+            "n_e2el": n_e2el,
             "OTT_mean(token/s)": round(mean_ott, 2),
             "OTT_per_card_mean(token/s)": round(mean_ott / n_cards, 2),
             "E2EL_mean(ms)": round(e2el_mean, 1) if isinstance(e2el_mean, float) else "",
@@ -229,7 +249,12 @@ def run(args: Namespace) -> int:
     print(f"[orch] run_root = {run_root}")
     print(f"[orch] deployments = {[d.name for d in deployments]}")
     print(f"[orch] datasets    = {list(datasets)}")
-    print(f"[orch] resource monitor = {'OFF' if args.no_monitor else f'ON (every {args.monitor_interval:.1f}s)'}")
+    if args.no_monitor:
+        print(f"[orch] resource monitor = OFF")
+    else:
+        eff = effective_interval(args.monitor_interval)
+        suffix = f" (requested {args.monitor_interval:.2f}s, clamped)" if eff != args.monitor_interval else ""
+        print(f"[orch] resource monitor = ON (every {eff:.2f}s){suffix}")
 
     summary_csv = run_root / "perf_summary.csv"
     rows: list[dict] = []
@@ -265,7 +290,9 @@ def run(args: Namespace) -> int:
                                 run_root / f"perf_throughput_{dep.name}.png")
     if len(deployments) > 1:
         plot_aggregated(rows, deployments, run_root / "perf_throughput.png")
-        plot_per_card(rows, deployments, run_root / "per_card_throughput.png")
+    # per_card_summary.csv 总是产出，per_card 图也总是产出（单部署时就一条曲线，
+    # 仍能直观看到单卡吞吐随 batch_size 的变化）
+    plot_per_card(rows, deployments, run_root / "per_card_throughput.png")
 
     print(f"\n[orch] done. {len(rows)} rows -> {summary_csv}")
     return 0

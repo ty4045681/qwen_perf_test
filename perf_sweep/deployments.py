@@ -55,10 +55,15 @@ DATASETS: dict[str, str] = {
 # ---------------------- 评测参数 ----------------------
 MAX_OUT_LEN = 200
 
-# E2E 延迟门槛（秒），从严到宽。画图时按列表顺序叠加视觉标记：
+# E2E 延迟门槛（秒），**必须升序**（从最宽松到最严格门槛靠后没意义；这里就是
+# 从最严到最宽，越往后越宽松）。画图时按列表顺序叠加视觉标记：
 #   E2EL_BUDGETS[0]  = 警告  (橙)
 #   E2EL_BUDGETS[1]  = 严重  (红)
+# plotter._worst_tier 选"跨过的最高门槛 index"，要求列表升序才能正确分级。
 E2EL_BUDGETS: list[float] = [60.0, 120.0]
+assert E2EL_BUDGETS == sorted(E2EL_BUDGETS), (
+    f"E2EL_BUDGETS 必须按升序排列，得到 {E2EL_BUDGETS}"
+)
 # 资源监控采样间隔（秒）。非 Ascend 机器仍会采 CPU/内存。
 RESOURCE_SAMPLE_INTERVAL_S = 2.0
 

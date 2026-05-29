@@ -13,9 +13,20 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
+
+# npu-smi subprocess 单次超时。stop() 的 join 超时基于这个值，保证 join
+# 不会在 worker 仍卡在 npu-smi 里就返回。
+_NPU_SMI_TIMEOUT_S = 5.0
+MIN_INTERVAL_S = 0.5  # 公开常量；orchestrator 用它把"展示给用户的间隔"对齐到实际间隔
+
+
+def effective_interval(requested_s: float) -> float:
+    """ResourceMonitor 内部 clamp 的同步函数，便于 orchestrator 提前显示真实间隔。"""
+    return max(MIN_INTERVAL_S, float(requested_s))
 
 
 # ---------------------- CPU / 内存（/proc） ----------------------
@@ -84,7 +95,8 @@ def _read_npu_smi() -> list[tuple[int, float, int, int]]:
     npu-smi 不可用或解析失败返回空列表。"""
     try:
         proc = subprocess.run(
-            ["npu-smi", "info"], capture_output=True, text=True, timeout=5,
+            ["npu-smi", "info"], capture_output=True, text=True,
+            timeout=_NPU_SMI_TIMEOUT_S,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
@@ -119,7 +131,12 @@ class ResourceMonitor:
     def __init__(self, interval_s: float = 2.0,
                  loaded_chip_mem_threshold_mb: int = 1024,
                  raw_log: Path | None = None):
-        self.interval = max(0.5, float(interval_s))
+        requested = float(interval_s)
+        self.interval = max(MIN_INTERVAL_S, requested)
+        if self.interval > requested:
+            print(f"[monitor] interval {requested}s 太小，已上调到 "
+                  f"{self.interval}s（最小 {MIN_INTERVAL_S}s）",
+                  file=sys.stderr)
         self.threshold = loaded_chip_mem_threshold_mb
         self.raw_log = raw_log
         self._stop_evt = threading.Event()
@@ -138,34 +155,63 @@ class ResourceMonitor:
 
     def _loop(self) -> None:
         prev_cpu = _read_cpu_jiffies()
-        raw_fh = open(self.raw_log, "a") if self.raw_log else None
+        raw_fh = None
+        if self.raw_log is not None:
+            try:
+                raw_fh = open(self.raw_log, "a")
+            except OSError as e:
+                print(f"[monitor] 打开 raw_log {self.raw_log} 失败：{e}；"
+                      f"继续采样但不写时序文件", file=sys.stderr)
         try:
-            # 立刻先采一次 npu 和内存（CPU 第一次没有 prev 拿不到）
+            # 第一轮只刷新 prev_cpu（jiffies 差分需要前后两次读数），
+            # 真正的 CPU 采样从下一轮开始；NPU/内存第一轮就采。
+            warmup = True
             while not self._stop_evt.is_set():
                 cpu_pct, prev_cpu = _cpu_percent(prev_cpu)
                 mem_pct = _mem_percent()
                 npu = _read_npu_smi()
                 ts = time.time() - self._t0
-                if cpu_pct is not None:
+                if cpu_pct is not None and not warmup:
                     self._cpu_samples.append(cpu_pct)
                 if mem_pct is not None:
                     self._mem_samples.append(mem_pct)
                 if npu:
                     self._npu_samples.append(npu)
                 if raw_fh:
-                    raw_fh.write(f"{ts:7.2f}  cpu={cpu_pct}  mem={mem_pct}  "
-                                 f"npu={npu}\n")
-                    raw_fh.flush()
+                    try:
+                        raw_fh.write(
+                            f"{ts:7.2f}  cpu={cpu_pct}  mem={mem_pct}  "
+                            f"npu={npu}\n"
+                        )
+                        raw_fh.flush()
+                    except OSError as e:
+                        print(f"[monitor] raw_log 写入失败：{e}；停止时序记录",
+                              file=sys.stderr)
+                        try:
+                            raw_fh.close()
+                        except OSError:
+                            pass
+                        raw_fh = None
+                warmup = False
                 if self._stop_evt.wait(self.interval):
                     break
         finally:
             if raw_fh:
-                raw_fh.close()
+                try:
+                    raw_fh.close()
+                except OSError:
+                    pass
 
     def stop(self) -> dict:
         self._stop_evt.set()
         if self._thread:
-            self._thread.join(timeout=self.interval + 2.0)
+            # worker 可能正卡在 npu-smi（最长 _NPU_SMI_TIMEOUT_S）+ 处理一轮
+            # 才看到 stop_evt，给出足够余量避免 join 提前返回时 _summarize
+            # 还在和后台线程竞争追加。
+            self._thread.join(timeout=self.interval + _NPU_SMI_TIMEOUT_S + 2.0)
+            if self._thread.is_alive():
+                print("[monitor] 后台线程超时未退出，结果可能不完整",
+                      file=sys.stderr)
         return self._summarize()
 
     def _summarize(self) -> dict:
@@ -190,8 +236,9 @@ class ResourceMonitor:
             mem_peak: tuple[int, int] | None = None  # (mem_used, chip_id)
             for snap in self._npu_samples:
                 for chip_id, aicore, mem_u, _ in snap:
-                    if chip_id in loaded:
-                        aicore_used.append(aicore)
+                    if chip_id not in loaded:
+                        continue
+                    aicore_used.append(aicore)
                     if mem_peak is None or mem_u > mem_peak[0]:
                         mem_peak = (mem_u, chip_id)
 

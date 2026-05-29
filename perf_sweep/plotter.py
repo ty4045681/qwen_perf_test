@@ -6,17 +6,31 @@ from pathlib import Path
 from .deployments import Deployment, E2EL_BUDGETS
 
 
-# E2EL 门槛的视觉编码：从严到宽叠加，越严重越靠后绘制以覆盖在上层。
-# 与 deployments.E2EL_BUDGETS 一一对应（位置 0=警告，位置 1=严重）。
-_TIER_STYLES = [
-    # (overlay color, line color, line style, label suffix)
-    {"overlay_face": "none",   "overlay_edge": "darkorange", "line_color": "darkorange", "line_style": "--", "z": 4},
-    {"overlay_face": "red",    "overlay_edge": "red",        "line_color": "red",        "line_style": "--", "z": 6},
+# E2EL 门槛的视觉编码。前两档手工调色（与历史一致）；多于 2 档时从 colormap
+# 取色，保证每档颜色都唯一可辨。约定 index 越大 = 越严重 = 越靠后绘制覆盖。
+_TIER_STYLES_BASE = [
+    {"overlay_face": "none", "overlay_edge": "darkorange",
+     "line_color": "darkorange", "line_style": "--", "z": 4},
+    {"overlay_face": "red", "overlay_edge": "red",
+     "line_color": "red", "line_style": "--", "z": 6},
 ]
 
 
 def _budget_style(idx: int) -> dict:
-    return _TIER_STYLES[idx] if idx < len(_TIER_STYLES) else _TIER_STYLES[-1]
+    if idx < len(_TIER_STYLES_BASE):
+        return _TIER_STYLES_BASE[idx]
+    # 第 3 档及以后：用 matplotlib 的 'Reds' colormap 继续向深红推
+    try:
+        import matplotlib.pyplot as plt
+        cmap = plt.get_cmap("Reds")
+        # 0.6 ~ 1.0 的深红区间，避免和前两档混淆
+        n_extra = max(1, len(E2EL_BUDGETS) - len(_TIER_STYLES_BASE))
+        t = 0.6 + 0.4 * ((idx - len(_TIER_STYLES_BASE) + 1) / n_extra)
+        color = cmap(min(1.0, t))
+    except Exception:
+        color = "darkred"
+    return {"overlay_face": color, "overlay_edge": color,
+            "line_color": color, "line_style": "--", "z": 6 + idx}
 
 
 def _try_import_matplotlib():
