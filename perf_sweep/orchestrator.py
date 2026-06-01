@@ -148,6 +148,7 @@ def _sweep_deployment(dep: Deployment, dep_dir: Path, datasets: dict[str, str],
                     raw_log = res_log_dir / f"bs{bs}_{lang}.tsv" if args.monitor_raw else None
                     mon = ResourceMonitor(
                         interval_s=args.monitor_interval,
+                        loaded_chip_mem_threshold_mb=args.npu_mem_threshold,
                         raw_log=raw_log,
                     )
                     mon.start()

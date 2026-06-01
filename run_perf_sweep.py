@@ -65,6 +65,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--monitor-interval", type=float,
                     default=RESOURCE_SAMPLE_INTERVAL_S,
                     help="资源采样间隔秒数（默认 2.0s）")
+    ap.add_argument("--npu-mem-threshold", type=int, default=8192,
+                    help="判定某 NPU 卡‘在用’的 HBM 阈值(MB)。910B3 空载基线约 3GB，"
+                         "默认 8192 越过基线；只统计 HBM 超过此值的卡的 AICore/显存")
     ap.add_argument("--monitor-raw", action="store_true",
                     help="每次 run_one 把每次采样的原始值落到 "
                          "<dep>/resource_samples/bs{N}_{lang}.tsv，便于事后画时序图")

@@ -5,7 +5,8 @@
 数据源：
   - CPU%   : /proc/stat 两次采样差分（不依赖 psutil）
   - 内存%  : /proc/meminfo (MemTotal - MemAvailable) / MemTotal
-  - NPU    : npu-smi info 解析，正则匹配每个 chip 的 "AICore(%)  Memory-Usage(MB)" 行
+  - NPU    : npu-smi info 解析，从表头行取 NPU 编号(0–7)、从指标行取 AICore(%) 与
+             HBM-Usage(MB)；24.x 版同时有 Memory-Usage/HBM 两列，取 HBM（设备显存）
 
 非 Ascend 机器（如本机调试）npu-smi 不存在时优雅降级，NPU 列留空。
 """
@@ -82,36 +83,77 @@ def _mem_percent() -> float | None:
 
 
 # ---------------------- NPU（npu-smi） ----------------------
-# npu-smi info 输出里每个 chip 占 2 行，关键的第二行形如：
-#   | 0                | 0000:81:00.0   | 0           1234 / 65536        |
-# 容错：AICore 可能是整数或浮点；Memory-Usage 单位 MB；分隔符可能空格也可能 /
-_NPU_LINE_RE = re.compile(
-    r"\|\s*(\d+)\s*\|\s*[0-9A-Fa-f:.]+\s*\|\s*([\d.]+)\s+(\d+)\s*/\s*(\d+)"
+# npu-smi info 里每个 NPU 占 2 行：
+#   | 0     910B3               | OK            | 96.7   50   0 / 0          |  <- 表头行：NPU 编号 + 名称
+#   | 0                         | 0000:C1:00.0  | 0      0 / 0     3401 / 65536 |  <- 指标行：Chip + Bus-Id + 指标
+# 指标行第一列是“NPU 内部的 Chip 序号”（单芯片卡恒为 0），不是 0–7 的 NPU 编号，
+# 因此 NPU 编号要从上面的表头行取，否则 8 张卡会全部塌缩成 chip 0。
+#
+# 显存列在不同 npu-smi 版本下不一样：
+#   - 旧版只有一对 "Memory-Usage(MB)  x / y"，这一对就是 HBM；
+#   - 24.x 版有两对 "Memory-Usage(MB)  0 / 0   HBM-Usage(MB)  3401 / 65536"，
+#     第一对（DDR）在 910B3 上恒为 0/0，真正的设备显存是第二对 HBM。
+# 所以解析时若出现第二对就用第二对（HBM），否则用第一对。
+_NPU_HDR_RE = re.compile(r"^\s*\|\s*(\d+)\s+\S+\s*\|")
+_NPU_METRIC_RE = re.compile(
+    r"\|\s*\d+\s*\|\s*[0-9A-Fa-f]{4}:[0-9A-Fa-f:.]+\s*\|\s*"
+    r"([\d.]+)\s+(\d+)\s*/\s*(\d+)(?:\s+(\d+)\s*/\s*(\d+))?"
 )
+# 输出底部进程表行形如：
+#   | 0       0                 | 4038460       | VLLMWorker               | 118       |
+# 即 "| NPU Chip | PID | 进程名 | 进程显存 |"。第二列是纯数字 PID（指标行那里是
+# 带冒号的 Bus-Id），靠这点把进程行和指标行区分开。"No running processes..." 行
+# 第一列不是数字，自然不匹配。
+_NPU_PROC_RE = re.compile(r"^\s*\|\s*(\d+)\s+\d+\s*\|\s*(\d+)\s*\|\s*(\S+)")
 
 
-def _read_npu_smi() -> list[tuple[int, float, int, int]]:
-    """返回每个 chip 的 (chip_id, aicore_pct, mem_used_MB, mem_total_MB)。
-    npu-smi 不可用或解析失败返回空列表。"""
+def _read_npu_smi() -> tuple[list[tuple[int, float, int, int]], set[int]]:
+    """返回 (rows, proc_chips)。
+      rows       : 每个 NPU 的 (npu_id, aicore_pct, hbm_used_MB, hbm_total_MB)
+      proc_chips : 进程表里挂着进程（vLLM 等）的 NPU 编号集合——这是"这张卡
+                   正被本次部署占用"的权威信号，与 HBM 用量多少无关。
+    npu-smi 不可用或解析失败返回 ([], set())。"""
     try:
         proc = subprocess.run(
             ["npu-smi", "info"], capture_output=True, text=True,
             timeout=_NPU_SMI_TIMEOUT_S,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return []
+        return [], set()
     if proc.returncode != 0:
-        return []
+        return [], set()
     rows: list[tuple[int, float, int, int]] = []
+    proc_chips: set[int] = set()
+    cur_npu: int | None = None
+    fallback = 0  # 万一没解析到表头行，用递增序号兜底，避免全部塌缩成同一个 id
     for line in proc.stdout.splitlines():
-        m = _NPU_LINE_RE.search(line)
+        # 进程行要先于表头判定：进程行的第一格 "0  0" 也会被 _NPU_HDR_RE 命中，
+        # 但它带的第二个数字是 PID，用 _NPU_PROC_RE 精确识别。
+        pm = _NPU_PROC_RE.search(line)
+        if pm:
+            proc_chips.add(int(pm.group(1)))
+            continue
+        hdr = _NPU_HDR_RE.match(line)
+        if hdr:
+            cur_npu = int(hdr.group(1))
+            continue
+        m = _NPU_METRIC_RE.search(line)
         if m:
+            g = m.groups()
             try:
-                rows.append((int(m.group(1)), float(m.group(2)),
-                             int(m.group(3)), int(m.group(4))))
-            except ValueError:
+                aicore = float(g[0])
+                # 有第二对 (HBM) 就用 HBM，否则用第一对
+                if g[3] is not None:
+                    mem_used, mem_total = int(g[3]), int(g[4])
+                else:
+                    mem_used, mem_total = int(g[1]), int(g[2])
+            except (ValueError, TypeError):
                 continue
-    return rows
+            npu_id = cur_npu if cur_npu is not None else fallback
+            rows.append((npu_id, aicore, mem_used, mem_total))
+            cur_npu = None
+            fallback += 1
+    return rows, proc_chips
 
 
 # ---------------------- 监控线程 ----------------------
@@ -129,8 +171,11 @@ class ResourceMonitor:
     """后台采样器；start() 立即返回，stop() 返回聚合 dict（可直接 dict-update 进 CSV 行）。"""
 
     def __init__(self, interval_s: float = 2.0,
-                 loaded_chip_mem_threshold_mb: int = 1024,
+                 loaded_chip_mem_threshold_mb: int = 8192,
                  raw_log: Path | None = None):
+        # "在用卡"优先用 npu-smi 进程表判定（哪张卡挂着 vLLM 进程）。只有进程表
+        # 解析不到时才退回这个 HBM 阈值：把 HBM 用量越过此值的卡当作在用。
+        # 910B3 读的是 HBM-Usage，空载基线约 3GB，默认 8192MB（8GB）越过基线。
         requested = float(interval_s)
         self.interval = max(MIN_INTERVAL_S, requested)
         if self.interval > requested:
@@ -145,6 +190,8 @@ class ResourceMonitor:
         self._mem_samples: list[float] = []
         # 按 (chip_id, snapshot_idx) 平铺
         self._npu_samples: list[list[tuple[int, float, int, int]]] = []
+        # 整个采样窗口里出现过 vLLM 进程的 NPU 编号并集（权威的"在用卡"信号）
+        self._npu_proc_chips: set[int] = set()
         self._t0 = 0.0
 
     def start(self) -> None:
@@ -169,7 +216,7 @@ class ResourceMonitor:
             while not self._stop_evt.is_set():
                 cpu_pct, prev_cpu = _cpu_percent(prev_cpu)
                 mem_pct = _mem_percent()
-                npu = _read_npu_smi()
+                npu, proc_chips = _read_npu_smi()
                 ts = time.time() - self._t0
                 if cpu_pct is not None and not warmup:
                     self._cpu_samples.append(cpu_pct)
@@ -177,11 +224,12 @@ class ResourceMonitor:
                     self._mem_samples.append(mem_pct)
                 if npu:
                     self._npu_samples.append(npu)
+                self._npu_proc_chips |= proc_chips
                 if raw_fh:
                     try:
                         raw_fh.write(
                             f"{ts:7.2f}  cpu={cpu_pct}  mem={mem_pct}  "
-                            f"npu={npu}\n"
+                            f"proc_chips={sorted(proc_chips)}  npu={npu}\n"
                         )
                         raw_fh.flush()
                     except OSError as e:
@@ -225,12 +273,15 @@ class ResourceMonitor:
             out["mem_util_max(%)"] = round(max(self._mem_samples), 2)
 
         if self._npu_samples:
-            # 识别"在用"的 chip：任一快照里 mem_used > threshold
-            loaded: set[int] = set()
-            for snap in self._npu_samples:
-                for chip_id, _, mem_u, _ in snap:
-                    if mem_u >= self.threshold:
-                        loaded.add(chip_id)
+            # 识别"在用"的 chip：优先用进程表（哪张卡挂着 vLLM 进程，与 HBM 用量
+            # 无关，启动期权重还没灌进 HBM 时也准）。进程表整个窗口都没解析到才
+            # 退回 HBM 阈值：任一快照里 mem_used >= threshold。
+            loaded: set[int] = set(self._npu_proc_chips)
+            if not loaded:
+                for snap in self._npu_samples:
+                    for chip_id, _, mem_u, _ in snap:
+                        if mem_u >= self.threshold:
+                            loaded.add(chip_id)
 
             aicore_used: list[float] = []
             mem_peak: tuple[int, int] | None = None  # (mem_used, chip_id)
