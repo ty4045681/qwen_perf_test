@@ -124,6 +124,55 @@ def stop_vllm(proc: subprocess.Popen, grace_s: float = 60.0) -> None:
         print("[vllm] WARN: proc still alive after SIGKILL")
 
 
+def dump_cpu_binding(log_path: Path, proc_pattern: str = "vllm serve") -> None:
+    """Best-effort：把 vllm worker 的 CPU 绑核 / 线程数 / NUMA 拓扑 dump 到 log_path。
+
+    诊断用途，绝不抛异常：缺少 pgrep/taskset/ps/lscpu（如本机调试）时优雅降级。
+    在 wait_until_ready 成功后调用一次，记录 enable_cpu_binding 实际把每个进程
+    绑到了哪些核心，便于和 perf_summary.csv 的整机 cpu_util 对照。
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = [f"# CPU binding snapshot — pattern={proc_pattern!r}\n"]
+
+    def _run(cmd: list[str]) -> str:
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+            return f"  ({cmd[0]} 不可用: {e})\n"
+        return p.stdout or ""
+
+    # 找 worker PID
+    try:
+        pg = subprocess.run(["pgrep", "-f", proc_pattern],
+                            capture_output=True, text=True, timeout=10)
+        pids = [x for x in pg.stdout.split() if x.isdigit()]
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        pids = []
+        lines.append(f"  (pgrep 不可用: {e})\n")
+
+    if not pids:
+        lines.append("  未找到匹配进程（可能未启动或非 Linux 调试环境）\n")
+    else:
+        lines.append(f"\n## PID/线程数/命令 (ps)\n")
+        lines.append(_run(["ps", "-o", "pid,ppid,nlwp,psr,comm", "-p", ",".join(pids)]))
+        lines.append(f"\n## 每进程 CPU 亲和性 (taskset -cp)\n")
+        for pid in pids:
+            lines.append(_run(["taskset", "-cp", pid]))
+
+    lines.append(f"\n## NUMA / 核心拓扑 (lscpu)\n")
+    lscpu = _run(["lscpu"])
+    lines.append("".join(
+        f"{ln}\n" for ln in lscpu.splitlines()
+        if "NUMA" in ln or ln.startswith("CPU(s)") or "Socket" in ln or "Core(s)" in ln
+    ) or lscpu)
+
+    try:
+        log_path.write_text("".join(lines), encoding="utf-8")
+        print(f"[vllm] cpu binding -> {log_path} ({len(pids)} procs)")
+    except OSError as e:
+        print(f"[vllm] WARN: 写 cpu binding 日志失败：{e}")
+
+
 def wait_port_free(host: str, port: int, timeout: float = 60.0) -> bool:
     """等到 host:port 不再被监听，避免下一个部署 bind 冲突。"""
     deadline = time.time() + timeout

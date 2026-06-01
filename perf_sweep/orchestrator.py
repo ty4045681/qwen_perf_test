@@ -29,6 +29,7 @@ from .resource_monitor import (
 )
 from .result_parser import collect_results
 from .vllm_server import (
+    dump_cpu_binding,
     render_start_script,
     start_vllm,
     stop_vllm,
@@ -126,8 +127,11 @@ def _sweep_deployment(dep: Deployment, dep_dir: Path, datasets: dict[str, str],
                                     timeout=args.ready_timeout):
                 print(f"[orch] {dep.name}: 未就绪，跳过本部署")
                 return  # finally 负责 stop_vllm + wait_port_free
+            # worker 已起齐，记录一次 enable_cpu_binding 的实际绑核情况
+            dump_cpu_binding(dep_dir / "cpu_affinity.log")
         else:
             print(f"[orch] {dep.name}: skip-launch，假定 vllm 已在 {VLLM_HOST}:{VLLM_PORT}")
+            dump_cpu_binding(dep_dir / "cpu_affinity.log")
 
         res_log_dir = dep_dir / "resource_samples"
         res_log_dir.mkdir(exist_ok=True)
