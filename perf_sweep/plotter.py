@@ -173,6 +173,217 @@ def plot_per_deployment(rows: list[dict], dep: Deployment, out_path: Path) -> No
     print(f"[plot] saved -> {out_path}")
 
 
+# ---------------------- 资源利用率（CPU/内存/NPU） ----------------------
+# 每个指标：CSV 里的 avg/max 列、图例标签、颜色、文件名后缀、单位。
+# avg 为 None 表示该指标只有 max（如 NPU 显存只采峰值）。
+_RES_PCT_METRICS = [
+    {"label": "CPU", "color": "tab:blue", "file": "cpu",
+     "avg": "cpu_util_avg(%)", "max": "cpu_util_max(%)", "unit": "%"},
+    {"label": "NPU AICore", "color": "tab:red", "file": "npu_aicore",
+     "avg": "npu_aicore_avg(%)", "max": "npu_aicore_max(%)", "unit": "%"},
+    {"label": "Memory", "color": "tab:green", "file": "mem",
+     "avg": "mem_util_avg(%)", "max": "mem_util_max(%)", "unit": "%"},
+]
+_RES_MEM_METRIC = {
+    "label": "NPU Mem Used", "color": "tab:purple", "file": "npu_mem",
+    "avg": None, "max": "npu_mem_used_max(MB)", "unit": "MB",
+}
+
+
+def _float_or_none(v) -> float | None:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resource_series(rows: list[dict], deployments: list[Deployment],
+                     avg_col: str | None, max_col: str) -> dict:
+    """{dep_name: [(batch_size, avg, max), ...]}，按 batch_size 升序。
+
+    资源是整机量、与数据集基本无关，所以跨数据集归约：
+      avg = 各数据集 avg 列的均值；max = 各数据集 max 列的最大值。
+    某点两者都缺则跳过；avg_col 为 None（只有 max 的指标）时 avg 恒为 None。
+    """
+    dep_names = {d.name for d in deployments}
+    bucket: dict[tuple[str, int], dict] = {}
+    for r in rows:
+        dep = r.get("deployment")
+        if dep not in dep_names:
+            continue
+        key = (dep, r["batch_size"])
+        slot = bucket.setdefault(key, {"avgs": [], "maxs": []})
+        if avg_col:
+            a = _float_or_none(r.get(avg_col))
+            if a is not None:
+                slot["avgs"].append(a)
+        m = _float_or_none(r.get(max_col))
+        if m is not None:
+            slot["maxs"].append(m)
+
+    out: dict[str, list[tuple[int, float | None, float | None]]] = {
+        d.name: [] for d in deployments}
+    for (dep, bs), slot in bucket.items():
+        avg = sum(slot["avgs"]) / len(slot["avgs"]) if slot["avgs"] else None
+        mx = max(slot["maxs"]) if slot["maxs"] else None
+        if avg is None and mx is None:
+            continue
+        out[dep].append((bs, avg, mx))
+    for v in out.values():
+        v.sort()
+    return out
+
+
+def _avg_max_style_handles(plt):
+    """两个线型图例项：实线=avg，虚线=max（黑色，仅示意线型）。"""
+    return [
+        plt.Line2D([0], [0], color="black", linewidth=1.8, label="avg"),
+        plt.Line2D([0], [0], color="black", linewidth=1.4, linestyle="--", label="max"),
+    ]
+
+
+def plot_resource_aggregated(rows: list[dict], deployments: list[Deployment],
+                             out_path: Path) -> None:
+    """聚合网格：每个部署一个子图，叠画 CPU%/NPU AICore%/内存% 随 batch_size。
+
+    类比 plot_aggregated。每个指标一种颜色，avg 实线、max 虚线；% 同轴 0-100。
+    """
+    plt = _try_import_matplotlib()
+    if plt is None:
+        return
+
+    series_by_metric = {
+        m["label"]: _resource_series(rows, deployments, m["avg"], m["max"])
+        for m in _RES_PCT_METRICS
+    }
+    if not any(any(s.values()) for s in series_by_metric.values()):
+        print("[plot] resource: 无资源数据（监控可能关闭或未采到），跳过聚合图")
+        return
+
+    n = len(deployments)
+    ncols = 3
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(16, 4.5 * nrows),
+                             sharey=True)
+    axes = axes.flatten() if hasattr(axes, "flatten") else [axes]
+
+    all_bs = sorted({bs for s in series_by_metric.values()
+                     for pts in s.values() for (bs, _, _) in pts})
+
+    for ax, dep in zip(axes, deployments):
+        drew = False
+        for m in _RES_PCT_METRICS:
+            pts = series_by_metric[m["label"]].get(dep.name, [])
+            if not pts:
+                continue
+            drew = True
+            avg_pts = [(bs, a) for (bs, a, _) in pts if a is not None]
+            max_pts = [(bs, mx) for (bs, _, mx) in pts if mx is not None]
+            if avg_pts:
+                ax.plot([p[0] for p in avg_pts], [p[1] for p in avg_pts],
+                        marker="o", color=m["color"], linewidth=1.8)
+            if max_pts:
+                ax.plot([p[0] for p in max_pts], [p[1] for p in max_pts],
+                        marker="x", color=m["color"], linewidth=1.4,
+                        linestyle="--", alpha=0.7)
+        ax.set_title(dep.name if drew else f"{dep.name}  (no data)")
+        ax.set_xlabel("Concurrency (batch_size)")
+        ax.set_ylabel("Utilization (%)")
+        ax.set_ylim(0, 105)
+        if all_bs:
+            ax.set_xticks(all_bs)
+        ax.grid(True, alpha=0.3)
+
+    for ax in axes[len(deployments):]:
+        ax.set_visible(False)
+
+    handles = [plt.Line2D([0], [0], color=m["color"], linewidth=1.8,
+                          label=m["label"]) for m in _RES_PCT_METRICS]
+    handles.extend(_avg_max_style_handles(plt))
+    fig.legend(handles=handles, loc="upper center",
+               ncol=len(handles), bbox_to_anchor=(0.5, 1.02))
+    fig.suptitle("910B3 Qwen3.6-35B-A3B-w8a8: Resource utilization vs concurrency "
+                 "across deployments", y=1.06, fontsize=13)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[plot] saved -> {out_path}")
+
+
+def plot_resource_metric(rows: list[dict], deployments: list[Deployment],
+                         metric: dict, out_path: Path) -> None:
+    """单指标跨部署对比：每个部署一条曲线，avg 实线 + max 虚线。
+
+    类比 plot_per_card。% 指标固定 0-100 轴；MB 指标（如 NPU 显存）自适应。
+    """
+    plt = _try_import_matplotlib()
+    if plt is None:
+        return
+
+    series = _resource_series(rows, deployments, metric["avg"], metric["max"])
+    if not any(series.values()):
+        print(f"[plot] resource[{metric['label']}]: 无数据，跳过")
+        return
+
+    fig, ax = plt.subplots(figsize=(11, 6))
+    cmap = plt.get_cmap("tab10")
+    dep_color = {d.name: cmap(i) for i, d in enumerate(deployments)}
+
+    for dep in deployments:
+        pts = series.get(dep.name, [])
+        if not pts:
+            continue
+        color = dep_color[dep.name]
+        avg_pts = [(bs, a) for (bs, a, _) in pts if a is not None]
+        max_pts = [(bs, mx) for (bs, _, mx) in pts if mx is not None]
+        label = f"{dep.name} ({dep.tp * dep.dp} cards)"
+        if avg_pts:
+            ax.plot([p[0] for p in avg_pts], [p[1] for p in avg_pts],
+                    marker="o", linewidth=1.8, color=color, label=label)
+        if max_pts:
+            # 没有 avg 线时（如 NPU 显存）用实线承载图例标签，否则 max 走虚线
+            ls, lbl = ("--", None) if avg_pts else ("-", label)
+            ax.plot([p[0] for p in max_pts], [p[1] for p in max_pts],
+                    marker="x", linewidth=1.4, linestyle=ls,
+                    color=color, alpha=0.7, label=lbl)
+
+    ax.set_xlabel("Concurrency (batch_size)")
+    ax.set_ylabel(f"{metric['label']} ({metric['unit']})")
+    if metric["unit"] == "%":
+        ax.set_ylim(0, 105)
+    all_bs = sorted({bs for pts in series.values() for (bs, _, _) in pts})
+    if all_bs:
+        ax.set_xticks(all_bs)
+    has_avg = metric["avg"] is not None
+    detail = "avg solid + max dashed" if has_avg else "peak only"
+    ax.set_title(
+        f"910B3 Qwen3.6-35B-A3B-w8a8: {metric['label']} utilization vs concurrency\n"
+        f"(mean across datasets; {detail})"
+    )
+    ax.grid(True, alpha=0.3)
+    handles, _ = ax.get_legend_handles_labels()
+    if has_avg:
+        handles = list(handles) + _avg_max_style_handles(plt)
+    ax.legend(handles=handles, loc="best", fontsize=9)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=130)
+    plt.close(fig)
+    print(f"[plot] saved -> {out_path}")
+
+
+def plot_resources(rows: list[dict], deployments: list[Deployment],
+                   out_dir: Path) -> None:
+    """出全套资源图：聚合网格 + 每个 % 指标跨部署对比 + NPU 显存(MB) 单独图。"""
+    plot_resource_aggregated(rows, deployments, out_dir / "resource_util.png")
+    for m in _RES_PCT_METRICS:
+        plot_resource_metric(rows, deployments, m,
+                             out_dir / f"resource_{m['file']}.png")
+    plot_resource_metric(rows, deployments, _RES_MEM_METRIC,
+                         out_dir / f"resource_{_RES_MEM_METRIC['file']}.png")
+
+
 def plot_aggregated(rows: list[dict], deployments: list[Deployment],
                     out_path: Path) -> None:
     """6 部署聚合图：2×3 子图，每格一个部署的 throughput 面板。共享 y 轴比例。"""

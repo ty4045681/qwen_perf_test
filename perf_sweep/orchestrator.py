@@ -21,7 +21,12 @@ from .deployments import (
     VLLM_HOST,
     VLLM_PORT,
 )
-from .plotter import plot_aggregated, plot_per_card, plot_per_deployment
+from .plotter import (
+    plot_aggregated,
+    plot_per_card,
+    plot_per_deployment,
+    plot_resources,
+)
 from .resource_monitor import (
     EMPTY_RESULT as EMPTY_RES_FIELDS,
     ResourceMonitor,
@@ -299,6 +304,9 @@ def run(args: Namespace) -> int:
     # per_card_summary.csv 总是产出，per_card 图也总是产出（单部署时就一条曲线，
     # 仍能直观看到单卡吞吐随 batch_size 的变化）
     plot_per_card(rows, deployments, run_root / "per_card_throughput.png")
+
+    # 资源利用率全套图（CPU/内存/NPU）；监控关闭或没采到数据时各函数自动跳过
+    plot_resources(rows, deployments, run_root)
 
     print(f"\n[orch] done. {len(rows)} rows -> {summary_csv}")
     return 0

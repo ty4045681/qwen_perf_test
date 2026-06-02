@@ -25,7 +25,12 @@ from .orchestrator import (
     _build_per_card_rows,
     _write_csv,
 )
-from .plotter import plot_aggregated, plot_per_card, plot_per_deployment
+from .plotter import (
+    plot_aggregated,
+    plot_per_card,
+    plot_per_deployment,
+    plot_resources,
+)
 
 
 # 规范部署顺序：先按内置 DEPLOYMENTS 的顺序，方便聚合图布局与历史一致。
@@ -151,6 +156,7 @@ def run_merge(inputs: list[str], out_dir: str | None) -> int:
     if len(deployments) > 1:
         plot_aggregated(rows, deployments, out / "perf_throughput.png")
     plot_per_card(rows, deployments, out / "per_card_throughput.png")
+    plot_resources(rows, deployments, out)
 
     print(f"\n[merge] done. {len(rows)} rows -> {out / 'perf_summary.csv'}")
     return 0
