@@ -29,6 +29,7 @@
 ```
 qwen_perf_test/
 ├── run_perf_sweep.py            # CLI 入口
+├── merge_runs.py                # 合并多次同配置 sweep 的结果（CLI 入口）
 ├── perf_sweep/
 │   ├── deployments.py           # 6 个 Deployment + 全局路径/端口/数据集
 │   ├── vllm_server.py           # 渲染脚本 / 启停 vllm / ready check
@@ -36,6 +37,7 @@ qwen_perf_test/
 │   ├── result_parser.py         # 解析 ais_bench 的 CSV/JSON
 │   ├── resource_monitor.py      # CPU/内存/NPU AI core+显存 后台采样
 │   ├── plotter.py               # 单部署双面板图 + 聚合图 + 单卡吞吐对比图
+│   ├── merge.py                 # 合并多份 perf_summary.csv → 一份完整结果
 │   └── orchestrator.py          # 主循环 + 增量 CSV + 单卡汇总
 └── templates/
     └── start_vllm.sh.tpl        # vllm 启动 bash 模板（env 全在 bash 里 export）
@@ -181,6 +183,41 @@ tail -f sweep.out
 
 ---
 
+## 合并多次结果（merge_runs.py）
+
+同一组 tp/dp 部署分多次跑完时（典型是每次只覆盖不同的 `batch_sizes` /
+`cudagraph_capture_sizes`），用 `merge_runs.py` 把多份 `perf_summary.csv` 拼成一份
+完整实验结果，并重算单卡汇总、重画全套图：
+
+```bash
+# 两次跑合成一份（不指定 --out 时落到 runs/merged_<时间戳>/）
+python3 merge_runs.py runs/20260601_090000 runs/20260601_140000
+
+# 指定输出目录
+python3 merge_runs.py runs/a runs/b --out runs/merged_full
+
+# 也可直接指向 csv
+python3 merge_runs.py runs/a/perf_summary.csv runs/b/perf_summary.csv
+```
+
+合并语义：
+
+- 以 `(tp, dp, batch_size, dataset)` 为唯一键。
+- 按命令行给出的**输入顺序，靠后的 run 覆盖靠前的同键行**，每条覆盖都打印
+  `[warn]` 告警。**把你认为更准的那次放在后面。**
+- 产物与单次 sweep 完全对齐：`perf_summary.csv`、各 `perf_summary_<dep>.csv`、
+  `per_card_summary.csv`，以及 `perf_throughput_<dep>.png` /
+  `perf_throughput.png`（多部署时）/ `per_card_throughput.png`。
+
+两点约束（设计使然）：
+
+1. `cudagraph_capture_sizes` 不进 CSV，合并结果也不体现它——它只影响数值本身。
+   重建出的 Deployment 仅用 tp/dp + 实际出现过的 batch_size 驱动聚合/画图。
+2. 合并只读历史 CSV，**不重跑 ais_bench**；分部署 `vllm.log` / `resource_samples/`
+   等原始产物仍各留在原 run 目录里，不会被搬进合并目录。
+
+---
+
 ## 输出说明
 
 ### `perf_summary.csv` / `perf_summary_<dep>.csv`
@@ -242,6 +279,10 @@ A: 看 `runs/<时间戳>/<dep>/vllm.log` —— 通常是 cudagraph capture 慢�
 **Q: 想中途补跑某个部署？**
 
 A: `python3 run_perf_sweep.py --only tp4_dp2 --run-root runs/<已存在的目录>` —— 注意这会**覆盖** `perf_summary_tp4_dp2.csv` 与聚合 CSV，其它部署的分部署 CSV 保留。
+
+**Q: 同一组 tp/dp 我分了好几次跑（每次不同 batch_sizes / capture_sizes），怎么拼成一份完整结果？**
+
+A: 用 `merge_runs.py`，见上文「合并多次结果」。各次跑各自落在独立的 `runs/<时间戳>/`，跑完再 `python3 merge_runs.py runs/第一次 runs/第二次` 合并即可——靠后的输入覆盖靠前的同键行，不要用 `--run-root` 指向同一目录互相覆盖。
 
 **Q: ais_bench 报错怎么办？**
 
