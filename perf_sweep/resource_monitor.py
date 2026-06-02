@@ -83,20 +83,29 @@ def _mem_percent() -> float | None:
 
 
 # ---------------------- NPU（npu-smi） ----------------------
-# npu-smi info 里每个 NPU 占 2 行：
-#   | 0     910B3               | OK            | 96.7   50   0 / 0          |  <- 表头行：NPU 编号 + 名称
-#   | 0                         | 0000:C1:00.0  | 0      0 / 0     3401 / 65536 |  <- 指标行：Chip + Bus-Id + 指标
-# 指标行第一列是“NPU 内部的 Chip 序号”（单芯片卡恒为 0），不是 0–7 的 NPU 编号，
-# 因此 NPU 编号要从上面的表头行取，否则 8 张卡会全部塌缩成 chip 0。
+# npu-smi info 里每个 NPU 占 2 行。两种已知格式：
+#   910B3（训练卡，HBM）：
+#     | 0     910B3 | OK           | 96.7  50  0 / 0            |  <- 表头：NPU 编号 + 名称
+#     | 0           | 0000:C1:00.0 | 0     0 / 0   3401 / 65536 |  <- 指标：Chip + Bus-Id + 指标
+#   310P3（推理卡，LPDDR）：
+#     | 0     310P3 | OK           | NA    32   788 / 788       |  <- 表头：NPU 编号 + 名称
+#     | 0     0     | 0000:01:00.0 | 0     3497 / 44213         |  <- 指标：Chip + Device + Bus-Id + 指标
+# 差异：310P3 指标行第一格是 "Chip Device" 两个数字（910B3 只有 Chip 一个），
+# 所以 _NPU_METRIC_RE 首格用 \d+(?:\s+\d+)? 兼容两种。NPU 编号一律从表头行取
+# （指标行的 Chip 恒为 0，单靠它会让所有卡塌缩成同一个 id）。
 #
-# 显存列在不同 npu-smi 版本下不一样：
-#   - 旧版只有一对 "Memory-Usage(MB)  x / y"，这一对就是 HBM；
-#   - 24.x 版有两对 "Memory-Usage(MB)  0 / 0   HBM-Usage(MB)  3401 / 65536"，
-#     第一对（DDR）在 910B3 上恒为 0/0，真正的设备显存是第二对 HBM。
-# 所以解析时若出现第二对就用第二对（HBM），否则用第一对。
+# 显存列在不同版本/型号下不一样：
+#   - 单对 "Memory-Usage(MB)  x / y"：这一对就是设备显存（310P3 LPDDR / 旧版 HBM）；
+#   - 两对 "Memory-Usage(MB) 0 / 0  HBM-Usage(MB) 3401 / 65536"：910B3 24.x，
+#     第一对（DDR）恒为 0/0，真正的设备显存是第二对 HBM。
+# 所以出现第二对就用第二对，否则用第一对。
+#
+# 解析顺序很关键：310P3 指标行的两数字首格 "| 0  0 |" 也会被 _NPU_HDR_RE 命中，
+# 因此循环里必须先用带 Bus-Id 锚点的 _NPU_METRIC_RE 判定指标行、匹配上就 continue，
+# 不让它落到表头分支被当成表头吞掉（这正是 310P3 上 NPU 指标全空的根因）。
 _NPU_HDR_RE = re.compile(r"^\s*\|\s*(\d+)\s+\S+\s*\|")
 _NPU_METRIC_RE = re.compile(
-    r"\|\s*\d+\s*\|\s*[0-9A-Fa-f]{4}:[0-9A-Fa-f:.]+\s*\|\s*"
+    r"\|\s*\d+(?:\s+\d+)?\s*\|\s*[0-9A-Fa-f]{4}:[0-9A-Fa-f:.]+\s*\|\s*"
     r"([\d.]+)\s+(\d+)\s*/\s*(\d+)(?:\s+(\d+)\s*/\s*(\d+))?"
 )
 # 输出底部进程表行形如：
@@ -133,10 +142,8 @@ def _read_npu_smi() -> tuple[list[tuple[int, float, int, int]], set[int]]:
         if pm:
             proc_chips.add(int(pm.group(1)))
             continue
-        hdr = _NPU_HDR_RE.match(line)
-        if hdr:
-            cur_npu = int(hdr.group(1))
-            continue
+        # 指标行要先于表头判定：310P3 指标行首格 "0  0" 也会被 _NPU_HDR_RE 命中，
+        # 但指标行第二格是 Bus-Id，_NPU_METRIC_RE 靠它精确识别，匹配上即 continue。
         m = _NPU_METRIC_RE.search(line)
         if m:
             g = m.groups()
@@ -153,6 +160,11 @@ def _read_npu_smi() -> tuple[list[tuple[int, float, int, int]], set[int]]:
             rows.append((npu_id, aicore, mem_used, mem_total))
             cur_npu = None
             fallback += 1
+            continue
+        hdr = _NPU_HDR_RE.match(line)
+        if hdr:
+            cur_npu = int(hdr.group(1))
+            continue
     return rows, proc_chips
 
 
@@ -173,9 +185,10 @@ class ResourceMonitor:
     def __init__(self, interval_s: float = 2.0,
                  loaded_chip_mem_threshold_mb: int = 8192,
                  raw_log: Path | None = None):
-        # "在用卡"优先用 npu-smi 进程表判定（哪张卡挂着 vLLM 进程）。只有进程表
-        # 解析不到时才退回这个 HBM 阈值：把 HBM 用量越过此值的卡当作在用。
-        # 910B3 读的是 HBM-Usage，空载基线约 3GB，默认 8192MB（8GB）越过基线。
+        # "在用卡" = 进程表（挂着本次部署 worker 的卡）与显存阈值（显存越过基线的
+        # 卡）的交集，详见 _summarize。本阈值即交集里的显存判据：显存用量越过此值
+        # 才算真正灌入了权重。910B3 读 HBM-Usage / 310P3 读 Memory-Usage，空载基线
+        # 约 2–3GB，默认 8192MB（8GB）足以越过基线。
         requested = float(interval_s)
         self.interval = max(MIN_INTERVAL_S, requested)
         if self.interval > requested:
@@ -273,15 +286,20 @@ class ResourceMonitor:
             out["mem_util_max(%)"] = round(max(self._mem_samples), 2)
 
         if self._npu_samples:
-            # 识别"在用"的 chip：优先用进程表（哪张卡挂着 vLLM 进程，与 HBM 用量
-            # 无关，启动期权重还没灌进 HBM 时也准）。进程表整个窗口都没解析到才
-            # 退回 HBM 阈值：任一快照里 mem_used >= threshold。
-            loaded: set[int] = set(self._npu_proc_chips)
-            if not loaded:
-                for snap in self._npu_samples:
-                    for chip_id, _, mem_u, _ in snap:
-                        if mem_u >= self.threshold:
-                            loaded.add(chip_id)
+            # 识别"在用"的 chip：进程表（哪张卡挂着本次部署的 worker）与显存阈值
+            # （哪张卡显存越过基线）取交集——既挂着进程、显存又确实灌满了才算在用。
+            # 这样共享机器上别的容器在某张卡留下的小进程（有进程但显存很低）不会被
+            # 误算进来。
+            proc_chips: set[int] = set(self._npu_proc_chips)
+            thresh_chips: set[int] = set()
+            for snap in self._npu_samples:
+                for chip_id, _, mem_u, _ in snap:
+                    if mem_u >= self.threshold:
+                        thresh_chips.add(chip_id)
+            # 退化兜底：两路信号都在就取交集；交集为空或某一路缺失时，按
+            #   交集 → 纯显存阈值 → 纯进程表 的优先级回退，避免直接判成"无在用卡"
+            # 而丢掉全部 NPU 指标。
+            loaded: set[int] = (proc_chips & thresh_chips) or thresh_chips or proc_chips
 
             aicore_used: list[float] = []
             mem_peak: tuple[int, int] | None = None  # (mem_used, chip_id)
